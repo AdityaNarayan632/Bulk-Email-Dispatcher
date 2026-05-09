@@ -12,13 +12,14 @@ app.use(express.json());
 
 // Routes
 app.use("/task", require("./routes/taskRoutes"));
+app.use("/campaign", require("./routes/campaignRoutes"));
 
-// Test route
+// Health check
 app.get("/", (req, res) => {
-  res.send("API running 🚀");
+  res.json({ message: "Bulk Email Dispatcher API running 🚀" });
 });
 
 // Start server
 app.listen(3000, () => {
-  console.log("Server running on port 3000");
+  console.log("Server running on port 3000 🚀");
 });
