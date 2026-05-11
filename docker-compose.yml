@@ -36,6 +36,7 @@ services:
       - REDIS_PASSWORD=
       - REDIS_TLS=false
       - MONGO_URI=mongodb://mongo:27017/bulkemailer
+      - JWT_SECRET=adeb582f9b41d99614da5e47641463cc479fd202e1c35d3c8b99d4aed343a11f
     depends_on:
       - redis
       - mongo
@@ -55,6 +56,7 @@ services:
       - REDIS_PASSWORD=
       - REDIS_TLS=false
       - MONGO_URI=mongodb://mongo:27017/bulkemailer
+      - JWT_SECRET=adeb582f9b41d99614da5e47641463cc479fd202e1c35d3c8b99d4aed343a11f
     depends_on:
       - redis
       - mongo
