@@ -1,12 +1,13 @@
 # 🧠 System Design — Bulk Email Campaign Dispatcher
 
-This document explains the problem this system solves, the architectural decisions made, the trade-offs involved, and the planned improvements. It exists to make the reasoning behind every decision transparent.
+This document explains the problem this system solves, the architectural decisions made, the trade-offs considered, and how each feature was implemented. It exists to make the reasoning behind every decision transparent.
 
 ---
 
 ## 📌 Problem Statement
 
 Sending bulk emails is a fundamentally slow operation. A single email delivery involves:
+
 - Establishing an SMTP connection
 - Authenticating with the mail server
 - Transmitting the message
@@ -18,22 +19,21 @@ Doing this **synchronously** inside an API request for hundreds or thousands of 
 - The client has to wait for all emails to finish before getting a response
 - Under high traffic, the server runs out of threads/connections and **crashes**
 - A single failed email can block or break the entire batch
+- No visibility into delivery progress
 
-**The core problem:** How do you accept a campaign of 500+ recipients via an API, respond instantly, and deliver all emails reliably in the background — without overloading the server?
+**The core problem:** How do you accept a campaign of 500+ recipients via an API, respond instantly, deliver all emails reliably in the background, handle failures gracefully, and prevent abuse — without overloading the server?
 
 ---
 
 ## 💡 The Approach
 
-The solution is to **decouple ingestion from delivery** using an asynchronous queue-based architecture.
+The solution is to **decouple ingestion from delivery** using an async queue-based architecture with multiple layers of resilience.
 
-Instead of sending emails inside the API handler:
-
-1. The API accepts the campaign, splits it into individual recipient jobs, and pushes each into a **Redis-backed queue**
+1. The API accepts the campaign, validates the user, checks rate limits, splits into individual jobs, and pushes each into a **Redis-backed BullMQ queue**
 2. The API immediately responds with a `campaign_id` — the client is never made to wait
-3. **Worker services** running as a separate process consume jobs from the queue independently and deliver emails one by one via Nodemailer
-4. After each delivery attempt, the worker updates campaign progress counters in Redis
-5. The client can poll a status endpoint at any time to see real-time delivery progress
+3. **Worker services** running as a separate process consume jobs independently and deliver emails via Nodemailer
+4. Failed jobs are **automatically retried** with exponential backoff before being moved to a Dead Letter Queue
+5. The client polls a status endpoint for real-time delivery progress
 
 This pattern is called the **Producer-Consumer model** and is the foundation of how every large-scale notification system works in production.
 
@@ -44,64 +44,56 @@ This pattern is called the **Producer-Consumer model** and is the foundation of 
 ```
 Client
   │
-  │  POST /task  { recipients: [...], subject, body }
+  │  POST /task + JWT token
   ▼
-┌─────────────────────┐
-│   Express.js API    │  ← Producer
-│  (app.js)           │
-│                     │
-│  1. Save campaign   │
-│     to MongoDB      │
-│  2. Split into      │
-│     individual jobs │
-│  3. Push to queue   │
-│  4. Return          │
-│     campaign_id     │
-└────────┬────────────┘
-         │ enqueue jobs
-         ▼
-┌─────────────────────┐
-│   BullMQ Queue      │  ← Buffer
-│   (Redis)           │
-│                     │
-│  [ job ] [ job ]    │
-│  [ job ] [ job ]    │
-│  [ job ] [ job ]    │
-└────────┬────────────┘
-         │ consume jobs
-         ▼
-┌─────────────────────┐
-│   Worker Service    │  ← Consumer
-│   (worker.js)       │
-│                     │
-│  For each job:      │
-│  1. Send email via  │
-│     Nodemailer      │
-│  2. On success →    │
-│     incr sent       │
-│     decr pending    │
-│  3. On failure →    │
-│     incr failed     │
-│     decr pending    │
-└─────────────────────┘
-         │ updates counters
-         ▼
-┌─────────────────────┐
-│   Redis Counters    │
-│                     │
-│  campaign:id:sent   │
-│  campaign:id:failed │
-│  campaign:id:pending│
-└─────────────────────┘
-         ▲
-         │ reads counters
-┌────────┴────────────┐
-│  GET /campaign/:id  │
-│  Status Endpoint    │
-└─────────────────────┘
-         ▲
-         │ polls
-       Client
+┌─────────────────────────┐
+│     Express.js API      │  ← Producer
+│                         │
+│  1. Verify JWT token    │
+│  2. Check rate limit    │
+│  3. Save to MongoDB     │
+│  4. Init Redis counters │
+│  5. Fan-out to queue    │
+│  6. Return campaign_id  │
+└──────────┬──────────────┘
+           │ enqueue jobs
+           ▼
+┌─────────────────────────┐
+│    BullMQ Queue         │  ← Buffer
+│    (Redis)              │
+│                         │
+│  [ job ] [ job ] [ job ]│
+│  attempts: 3            │
+│  backoff: exponential   │
+└──────────┬──────────────┘
+           │ consume jobs
+           ▼
+┌─────────────────────────┐
+│    Worker Service       │  ← Consumer
+│                         │
+│  For each job:          │
+│  → Send via Nodemailer  │
+│  → Success: incr sent   │
+│  → Fail: retry (3x)    │
+│  → All retries fail:    │
+│    → Dead Letter Queue  │
+└─────────────────────────┘
+           │
+           ▼
+┌─────────────────────────┐
+│    Redis Counters       │
+│                         │
+│  campaign:id:total      │
+│  campaign:id:sent       │
+│  campaign:id:failed     │
+│  campaign:id:pending    │
+└─────────────────────────┘
+           ▲
+           │ reads counters
+┌──────────┴──────────────┐
+│  GET /campaign/:id      │
+│  Status Endpoint        │
+└─────────────────────────┘
 ```
 
 ---
@@ -112,10 +104,11 @@ Client
 
 A plain Redis `LPUSH`/`RPOP` list could technically work as a queue, but BullMQ gives:
 
-- **Job state management** — jobs move through `waiting → active → completed/failed` states automatically
-- **Concurrency control** — you can set how many jobs a worker processes simultaneously
-- **Built-in retry logic** — failed jobs can be automatically retried (planned)
-- **Job visibility** — you can inspect queued, active, and failed jobs easily
+- **Job state management** — jobs move through `waiting → active → completed/failed` automatically
+- **Built-in retry with backoff** — configurable attempts and delay strategies out of the box
+- **Dead Letter Queue** — failed jobs accessible via `getFailed()` for inspection and requeue
+- **Concurrency control** — control how many jobs a worker processes simultaneously
+- **Job visibility** — inspect queued, active, and failed jobs at any time
 
 BullMQ is built on top of Redis — so we get Redis's speed with a proper job queue abstraction on top.
 
@@ -123,101 +116,120 @@ BullMQ is built on top of Redis — so we get Redis's speed with a proper job qu
 
 ### 2. Why split into one job per recipient instead of one job per campaign?
 
-The alternative would be to push the entire campaign as a single job and loop through all recipients inside the worker. The problem with that approach:
+The alternative would be to push the entire campaign as a single job and loop through recipients inside the worker. The problem:
 
-- If the worker crashes halfway through, the entire campaign has to restart from zero
-- You can't track per-recipient delivery status
+- If the worker crashes halfway, the entire campaign restarts from zero
+- No per-recipient delivery tracking
 - Only one worker handles the entire campaign — no parallelism
+- A single bad recipient fails the entire campaign
 
 By splitting into one job per recipient:
+
 - Each email is an independent atomic unit of work
-- Multiple workers can process different recipients simultaneously
-- If one email fails, only that job fails — the rest continue
+- Multiple workers process different recipients simultaneously
+- If one email fails, only that job retries — the rest continue
 - Redis counters give real-time per-campaign visibility
 
 ---
 
 ### 3. Why Redis for status counters instead of MongoDB?
 
-Campaign progress is updated after **every single email send** — potentially hundreds of writes per second during a large campaign. MongoDB is a great persistent store but is slower for this kind of high-frequency atomic increment operation.
+Campaign progress is updated after **every single email send** — potentially hundreds of writes per second. MongoDB is great for persistence but slower for high-frequency atomic operations.
 
-Redis `INCR` and `DECR` operations are:
-- **Atomic** — no race conditions when multiple workers update the same counter simultaneously
+Redis `INCR` and `DECR` are:
+
+- **Atomic** — no race conditions when multiple workers update simultaneously
 - **In-memory** — microsecond latency, perfect for high-frequency writes
-- **Simple** — a counter is the right data structure for this, not a document
+- **Simple** — a counter is the right data structure, not a document
 
-MongoDB stores the campaign metadata (recipients list, subject, body, timestamps). Redis handles the live counters. Both are used for what they're best at.
+MongoDB stores campaign metadata permanently. Redis handles live counters. Both are used for what they're best at. When Redis counters expire, the status endpoint falls back to MongoDB.
 
 ---
 
-### 4. Why a separate worker process instead of running inside the API?
+### 4. Why a separate worker process?
 
 Running workers inside `app.js` would mean:
-- Restarting the API also kills all in-flight email jobs
+
+- Restarting the API kills all in-flight email jobs
 - CPU-intensive email processing competes with API request handling
-- You can't scale workers independently of the API
+- Workers can't scale independently of the API
 
 A separate `worker.js` process means:
-- API and workers can be restarted independently
-- Workers can be scaled horizontally (`node worker.js` in multiple terminals or containers) without touching the API
-- Clear separation of concerns — the API handles HTTP, the worker handles delivery
+
+- API and workers restart independently
+- Workers scale horizontally (`docker-compose up --scale worker=3`) without touching the API
+- Clear separation of concerns
 
 ---
 
-## ⚖️ Trade-offs & Current Limitations
+### 5. Why JWT over API Keys?
 
-| Limitation | Impact | Planned Fix |
-|---|---|---|
-| No retry logic | A failed email is permanently lost | Dead Letter Queue + exponential backoff |
-| No authentication | Anyone can submit a campaign | JWT middleware on API routes |
-| No rate limiting | API can be flooded with requests | Sliding window rate limiter using Redis |
-| No Docker setup | Setup requires manual Redis/MongoDB config | docker-compose with all services |
-| Redis counters are volatile | If Redis restarts, progress counters reset | Persist final counts to MongoDB on completion |
-| No email validation | Invalid emails cause worker errors silently | Validate emails before enqueuing |
+API Keys are simpler but JWT provides:
+
+- **Stateless authentication** — no DB lookup per request, token is self-contained
+- **Expiry built-in** — tokens expire automatically (7 days)
+- **User identity in token** — `req.user.id` available in middleware without a DB call
+- **Standard** — industry standard for REST API auth
 
 ---
 
-## 🚧 Planned Improvements
+### 6. Why Redis for rate limiting?
 
-### Dead Letter Queue (DLQ) + Retry with Exponential Backoff
-When an email fails to send, instead of dropping it, it should be retried with increasing wait times:
-- Attempt 1 fails → retry after 2s
-- Attempt 2 fails → retry after 4s
-- Attempt 3 fails → retry after 8s
-- After 3 failures → move to Dead Letter Queue for manual inspection
+Rate limiting needs to be:
 
-This ensures transient failures (SMTP timeout, network blip) don't result in undelivered emails.
+- **Fast** — checked on every request before any business logic
+- **Shared across workers** — if you scale the API to multiple instances, rate limits must be shared
+- **Atomic** — `INCR` + `EXPIRE` in Redis gives a thread-safe sliding window counter
 
-### JWT Authentication
-Currently the `POST /task` endpoint is open to anyone. Adding JWT middleware ensures only authenticated users can submit campaigns, protecting against abuse.
-
-### Rate Limiting
-Using Redis to implement a sliding window rate limiter — e.g. max 10 campaigns per user per hour. Prevents a single user from flooding the queue.
-
-### Docker + docker-compose
-A `docker-compose.yml` that spins up the API, worker, Redis, and MongoDB with a single `docker-compose up` command — making the system truly portable and cloud-ready.
-
-### Prometheus + Grafana Metrics
-Expose a `/metrics` endpoint tracking:
-- `queue_depth` — how many jobs are waiting
-- `emails_sent_total` — cumulative counter
-- `emails_failed_total` — cumulative counter
-- `worker_processing_duration` — how long each email takes
-
-Visualised on a Grafana dashboard for real-time system observability.
+Using Redis means rate limits work correctly even when the API is scaled horizontally.
 
 ---
 
-## 📚 Concepts This Project Demonstrates
+## ⚖️ Trade-offs & Decisions
 
-| Concept | Where it appears |
-|---|---|
-| Producer-Consumer pattern | API enqueues, worker consumes |
-| Async task processing | Jobs processed independently of HTTP request lifecycle |
-| Horizontal scaling | Multiple workers, same queue |
-| Atomic operations | Redis INCR/DECR for concurrent counter updates |
-| Separation of concerns | API, queue, worker, database all decoupled |
-| Fault isolation | One failed job doesn't affect others |
+| Decision                       | Trade-off                                                                    |
+| ------------------------------ | ---------------------------------------------------------------------------- |
+| One job per recipient          | More jobs in queue, but better fault isolation and parallelism               |
+| Redis counters for status      | Fast writes but volatile — mitigated by MongoDB fallback                     |
+| Exponential backoff (2s→4s→8s) | Delays retry but prevents hammering a failing SMTP server                    |
+| JWT with 7-day expiry          | Convenient but tokens can't be invalidated before expiry without a blocklist |
+| Fail-open rate limiter         | If Redis is down, requests pass through — availability over strict limiting  |
+
+---
+
+## 🔐 Security Decisions
+
+- Passwords hashed with **bcrypt** (10 salt rounds) before storing in MongoDB
+- JWT signed with a secret key stored in environment variables — never hardcoded
+- `.env` excluded from Docker image via `.dockerignore`
+- Rate limiting prevents queue flooding from a single user
+- Input validation on all endpoints before any DB or queue operations
+
+---
+
+## 📊 Concepts This Project Demonstrates
+
+| Concept                   | Where it appears                                |
+| ------------------------- | ----------------------------------------------- |
+| Producer-Consumer pattern | API enqueues, worker consumes                   |
+| Async task processing     | Jobs processed independently of HTTP lifecycle  |
+| Horizontal scaling        | Multiple workers, same queue                    |
+| Atomic operations         | Redis INCR/DECR for concurrent counter updates  |
+| Fault tolerance           | Retry with backoff + Dead Letter Queue          |
+| Separation of concerns    | API, queue, worker, database all decoupled      |
+| Stateless authentication  | JWT middleware                                  |
+| Abuse prevention          | Redis rate limiting per user                    |
+| Containerization          | Docker + docker-compose for portable deployment |
+
+---
+
+## 🚀 Potential Future Improvements
+
+- **Prometheus + Grafana** — expose `/metrics` endpoint for queue depth, delivery rate, and worker performance dashboards
+- **Webhook notifications** — notify a URL when a campaign completes instead of requiring polling
+- **Email templates** — support HTML email bodies with variable substitution
+- **Campaign scheduling** — submit a campaign to be sent at a future time
+- **Unsubscribe handling** — track and respect unsubscribe requests per recipient
 
 ---
 

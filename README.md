@@ -1,6 +1,6 @@
 # 📬 Bulk Email Campaign Dispatcher
 
-A scalable backend system for dispatching bulk email campaigns asynchronously. Users submit a campaign via a REST API — the system splits each recipient into an individual job, queues them through **BullMQ + Redis**, and **worker services** process and deliver emails in parallel via **Nodemailer** — without ever blocking the API.
+A production-grade bulk email dispatch system built with Node.js, BullMQ, and Redis. Users submit email campaigns via a secured REST API — the system splits each recipient into an individual job, queues them through a Redis-backed BullMQ queue, and parallel worker services deliver emails asynchronously via Nodemailer. Real-time delivery tracking, fault-tolerant retry logic, JWT authentication, and rate limiting included.
 
 ---
 
@@ -10,8 +10,11 @@ A scalable backend system for dispatching bulk email campaigns asynchronously. U
 Client
   │
   │  POST /task  { recipients: [...], subject, body }
+  │  Authorization: Bearer <jwt_token>
   ▼
 Express.js API
+  │  validates JWT token
+  │  checks rate limit (10 req/min per user)
   │  splits into individual jobs
   │  pushes each into BullMQ queue
   │  returns { campaign_id, status: "queued" }
@@ -21,7 +24,7 @@ BullMQ Queue (Redis)
   │
   ├──▶ Worker → sends email → updates sent/pending count
   ├──▶ Worker → sends email → updates sent/pending count
-  └──▶ Worker → sends email → updates failed/pending count
+  └──▶ Worker → fails → retries (2s → 4s → 8s) → DLQ
 
 Client polls GET /campaign/:id
   ◀── { sent: 340, failed: 12, pending: 148 }
@@ -31,24 +34,30 @@ Client polls GET /campaign/:id
 
 ## ✨ Features
 
-- **Async email dispatch** — API returns instantly, emails are sent in the background
-- **BullMQ + Redis queue** — each recipient is an independent job processed in parallel
-- **Real-time campaign tracking** — track sent, failed, and pending counts per campaign
-- **Nodemailer integration** — sends emails via Gmail SMTP
-- **MongoDB integration** — stores campaign and task metadata
-- **Horizontal scaling** — spin up multiple workers against the same queue with zero code changes
+- **Async bulk email dispatch** — API responds instantly, emails sent in background
+- **BullMQ + Redis queue** — each recipient is an independent parallel job
+- **Real-time campaign tracking** — live sent, failed, and pending counts per campaign
+- **Fault-tolerant retry** — failed jobs retry 3 times with exponential backoff (2s → 4s → 8s)
+- **Dead Letter Queue (DLQ)** — permanently failed jobs stored for inspection and manual requeue
+- **JWT Authentication** — secure token-based auth on all campaign endpoints
+- **Rate limiting** — Redis-based per-user rate limit (10 requests/minute)
+- **MongoDB persistence** — campaign metadata stored permanently
+- **Dockerized** — one command spins up the entire system
+- **Horizontal scaling** — multiple workers consume the same queue with zero code changes
 
 ---
 
 ## 🛠️ Tech Stack
 
-| Layer | Technology |
-|---|---|
-| API Server | Node.js, Express.js |
-| Queue | BullMQ, Redis (ioredis) |
-| Email Delivery | Nodemailer (Gmail SMTP) |
-| Database | MongoDB, Mongoose |
-| Dev Tools | Nodemon, dotenv |
+| Layer            | Technology                   |
+| ---------------- | ---------------------------- |
+| API Server       | Node.js, Express.js          |
+| Queue            | BullMQ, Redis (ioredis)      |
+| Email Delivery   | Nodemailer (Gmail SMTP)      |
+| Database         | MongoDB, Mongoose            |
+| Auth             | JWT (jsonwebtoken), bcryptjs |
+| Rate Limiting    | Redis sliding window         |
+| Containerization | Docker, docker-compose       |
 
 ---
 
@@ -57,19 +66,31 @@ Client polls GET /campaign/:id
 ```
 Bulk-Email-Dispatcher/
 ├── config/
-│   └── db.js              # MongoDB connection
+│   ├── db.js               # MongoDB connection
+│   └── redis.js            # Redis connection
 ├── controllers/
-│   └── taskController.js  # Campaign submission logic
+│   ├── authController.js   # Register + login logic
+│   └── taskController.js   # Campaign + DLQ logic
+├── middleware/
+│   ├── auth.js             # JWT verification
+│   └── rateLimit.js        # Redis rate limiter
 ├── models/
-│   └── task.js            # Mongoose task/campaign schema
+│   ├── campaign.js         # Campaign schema
+│   └── user.js             # User schema
 ├── queue/
-│   └── taskQueue.js       # BullMQ queue setup
+│   └── taskQueue.js        # BullMQ queue setup
 ├── routes/
-│   └── taskRoutes.js      # API route definitions
-├── app.js                 # Express server entry point
-├── worker.js              # BullMQ worker — email dispatch
+│   ├── authRoutes.js       # Auth endpoints
+│   ├── campaignRoutes.js   # Campaign + DLQ endpoints
+│   └── taskRoutes.js       # Task submission endpoint
+├── app.js                  # Express server
+├── worker.js               # BullMQ worker
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
 ├── .gitignore
-└── package.json
+├── README.md
+└── SYSTEM_DESIGN.md
 ```
 
 ---
@@ -78,9 +99,7 @@ Bulk-Email-Dispatcher/
 
 ### Prerequisites
 
-- Node.js v18+
-- Redis instance (local or cloud — e.g. Upstash)
-- MongoDB instance (local or Atlas)
+- Docker Desktop installed and running
 - Gmail account with App Password enabled
 
 ### 1. Clone the repo
@@ -90,52 +109,89 @@ git clone https://github.com/AdityaNarayan632/Bulk-Email-Dispatcher.git
 cd Bulk-Email-Dispatcher
 ```
 
-### 2. Install dependencies
-
-```bash
-npm install
-```
-
-### 3. Set up environment variables
+### 2. Set up environment variables
 
 Create a `.env` file in the root:
 
 ```env
+# MongoDB
+MONGO_URI=your_mongodb_connection_string
+
 # Redis
 REDIS_HOST=your_redis_host
 REDIS_PORT=6379
 REDIS_PASSWORD=your_redis_password
-
-# MongoDB
-MONGO_URI=your_mongodb_connection_string
+REDIS_TLS=true
 
 # Email (Gmail)
 EMAIL_USER=your_email@gmail.com
 EMAIL_PASS=your_gmail_app_password
+
+# JWT
+JWT_SECRET=your_jwt_secret_key
 ```
 
 > ⚠️ For Gmail, use an **App Password** not your account password. Enable it at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
 
-### 4. Start the API server
+> ⚠️ Generate a JWT secret by running: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+
+### 3. Start the entire system
 
 ```bash
-npm run dev
+docker-compose up --build
 ```
 
-### 5. Start the worker (in a separate terminal)
-
-```bash
-node worker.js
-```
+This starts Redis, MongoDB, the API server, and the worker — all in one command.
 
 ---
 
 ## 📮 API Reference
 
-### Submit a Campaign
+### Auth
+
+#### Register
+
+```http
+POST /auth/register
+Content-Type: application/json
+```
+
+```json
+{
+  "email": "user@gmail.com",
+  "password": "yourpassword"
+}
+```
+
+#### Login
+
+```http
+POST /auth/login
+Content-Type: application/json
+```
+
+```json
+{
+  "email": "user@gmail.com",
+  "password": "yourpassword"
+}
+```
+
+**Response:**
+
+```json
+{ "token": "eyJhbGciOiJIUzI1NiIs..." }
+```
+
+---
+
+### Campaigns
+
+#### Submit a Campaign
 
 ```http
 POST /task
+Authorization: Bearer <token>
 Content-Type: application/json
 ```
 
@@ -157,7 +213,7 @@ Content-Type: application/json
 }
 ```
 
-### Check Campaign Status
+#### Check Campaign Status
 
 ```http
 GET /campaign/:id
@@ -168,32 +224,59 @@ GET /campaign/:id
 ```json
 {
   "campaign_id": "abc123",
+  "status": "processing",
+  "total": 2,
   "sent": 1,
   "failed": 0,
   "pending": 1
 }
 ```
 
+#### View Failed Jobs (DLQ)
+
+```http
+GET /campaign/dlq/failed
+```
+
+#### Requeue a Failed Job
+
+```http
+POST /campaign/dlq/retry/:jobId
+```
+
 ---
 
 ## 🔄 How It Works
 
-1. Client sends a `POST /task` with a list of recipients
-2. API creates a campaign record in MongoDB and pushes one BullMQ job per recipient into Redis
-3. Worker picks up jobs from the queue and sends emails via Nodemailer
-4. After each send, worker increments `sent` or `failed` and decrements `pending` counters in Redis
-5. Client polls `GET /campaign/:id` to track progress in real time
+1. Client registers and logs in to receive a JWT token
+2. Client sends `POST /task` with token — API validates JWT and checks rate limit
+3. API creates a campaign in MongoDB, initializes Redis counters, and fans out one BullMQ job per recipient
+4. Workers pick up jobs in parallel, send emails via Nodemailer, and update Redis counters
+5. Failed jobs are automatically retried up to 3 times with exponential backoff
+6. After 3 failures, jobs move to the Dead Letter Queue for manual inspection
+7. Client polls `GET /campaign/:id` for real-time delivery progress
 
 ---
 
-## 🚧 Roadmap
+## 🐳 Docker Commands
 
-- [ ] Dead Letter Queue (DLQ) for permanently failed jobs
-- [ ] Retry with exponential backoff
-- [ ] JWT authentication on API routes
-- [ ] Rate limiting per user
-- [ ] Docker + docker-compose setup
-- [ ] Prometheus + Grafana metrics dashboard
+```bash
+# Start everything
+docker-compose up --build
+
+# Run in background
+docker-compose up -d
+
+# Stop everything
+docker-compose down
+
+# Scale to 3 workers
+docker-compose up --scale worker=3
+
+# View logs
+docker logs api
+docker logs worker
+```
 
 ---
 
