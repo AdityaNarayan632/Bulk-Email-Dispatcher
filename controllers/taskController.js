@@ -8,7 +8,6 @@ exports.createTask = async (req, res) => {
   try {
     const { recipients, subject, body } = req.body;
 
-    // Input validation
     if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
       return res
         .status(400)
@@ -18,11 +17,9 @@ exports.createTask = async (req, res) => {
       return res.status(400).json({ error: "subject and body are required" });
     }
 
-    // 1. Generate campaign ID
     const campaignId = new mongoose.Types.ObjectId().toString();
     const total = recipients.length;
 
-    // 2. Save campaign to MongoDB
     await Campaign.create({
       _id: campaignId,
       recipients,
@@ -31,28 +28,25 @@ exports.createTask = async (req, res) => {
       total,
     });
 
-    // 3. Initialize Redis counters
     await redis.set(`campaign:${campaignId}:total`, total);
     await redis.set(`campaign:${campaignId}:sent`, 0);
     await redis.set(`campaign:${campaignId}:failed`, 0);
     await redis.set(`campaign:${campaignId}:pending`, total);
 
-    // 4. Push one job per recipient into the queue (fan-out)
     for (let email of recipients) {
-      await taskQueue.add("email", {
-        campaignId,
-        to: email,
-        subject,
-        body,
-      });
+      await taskQueue.add(
+        "email",
+        { campaignId, to: email, subject, body },
+        {
+          attempts: 3,
+          backoff: { type: "exponential", delay: 2000 },
+          removeOnComplete: false,
+          removeOnFail: false,
+        },
+      );
     }
 
-    // 5. Respond immediately — don't wait for emails to send
-    res.status(201).json({
-      campaign_id: campaignId,
-      status: "queued",
-      total,
-    });
+    res.status(201).json({ campaign_id: campaignId, status: "queued", total });
   } catch (err) {
     console.error("createTask error:", err);
     res.status(500).json({ error: err.message });
@@ -69,7 +63,6 @@ exports.getCampaignStatus = async (req, res) => {
     const failed = await redis.get(`campaign:${id}:failed`);
     const pending = await redis.get(`campaign:${id}:pending`);
 
-    // If not in Redis, try MongoDB as fallback
     if (total === null) {
       const campaign = await Campaign.findById(id);
       if (!campaign) {
@@ -89,7 +82,6 @@ exports.getCampaignStatus = async (req, res) => {
     const parsedPending = parseInt(pending);
     const status = parsedPending === 0 ? "completed" : "processing";
 
-    // If completed, update MongoDB status too
     if (status === "completed") {
       await Campaign.findByIdAndUpdate(id, { status: "completed" });
     }
@@ -104,6 +96,40 @@ exports.getCampaignStatus = async (req, res) => {
     });
   } catch (err) {
     console.error("getCampaignStatus error:", err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /campaign/dlq/failed
+exports.getFailedJobs = async (req, res) => {
+  try {
+    const failedJobs = await taskQueue.getFailed();
+    const jobs = failedJobs.map((job) => ({
+      job_id: job.id,
+      campaign_id: job.data.campaignId,
+      to: job.data.to,
+      subject: job.data.subject,
+      failed_reason: job.failedReason,
+      attempts_made: job.attemptsMade,
+      failed_at: job.finishedOn,
+    }));
+    res.json({ total: jobs.length, failed_jobs: jobs });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// POST /campaign/dlq/retry/:jobId
+exports.retryFailedJob = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const job = await taskQueue.getJob(jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+    await job.retry();
+    res.json({ message: `Job ${jobId} requeued successfully` });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 };
